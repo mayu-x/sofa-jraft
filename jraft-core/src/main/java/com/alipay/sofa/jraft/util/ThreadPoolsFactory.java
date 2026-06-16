@@ -29,6 +29,7 @@ import org.slf4j.LoggerFactory;
 import com.alipay.sofa.jraft.Closure;
 import com.alipay.sofa.jraft.Status;
 import com.alipay.sofa.jraft.closure.InternalClosure;
+import java.util.concurrent.*;
 
 /**
  * ThreadPool based on Raft-Group isolation
@@ -102,7 +103,15 @@ public class ThreadPoolsFactory {
      * Run a task in thread pool,returns the future object.
      */
     public static Future<?> runInThread(String groupId, final Runnable runnable) {
-        return GROUP_THREAD_POOLS.getOrDefault(groupId, GlobalThreadPoolHolder.INSTANCE).submit(runnable);
+        try {
+            return GROUP_THREAD_POOLS.getOrDefault(groupId, GlobalThreadPoolHolder.INSTANCE).submit(runnable);
+        } catch (final RejectedExecutionException e) {
+            // PATCH: visibility only, behavior unchanged (log and rethrow
+            // as-is). The default pool uses SynchronousQueue + AbortPolicy, so a saturated
+            // pool rejects silently from the caller's perspective unless the caller logs.
+            LOG.error("Group {} thread pool rejected a task submission.", groupId, e);
+            throw e;
+        }
     }
 
     /**

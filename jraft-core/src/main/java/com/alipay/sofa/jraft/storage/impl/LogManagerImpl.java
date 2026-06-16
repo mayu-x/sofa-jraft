@@ -22,6 +22,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -78,32 +81,57 @@ import com.lmax.disruptor.dsl.ProducerType;
  */
 public class LogManagerImpl implements LogManager {
 
-    private static final Logger                              LOG                   = LoggerFactory
-                                                                                       .getLogger(LogManagerImpl.class);
+    private static final Logger                              LOG                            = LoggerFactory
+                                                                                                .getLogger(LogManagerImpl.class);
     private String                                           groupId;
     private LogStorage                                       logStorage;
     private ConfigurationManager                             configManager;
     private FSMCaller                                        fsmCaller;
-    private final ReadWriteLock                              lock                  = new ReentrantReadWriteLock();
-    private final Lock                                       writeLock             = this.lock.writeLock();
-    private final Lock                                       readLock              = this.lock.readLock();
+    private final ReadWriteLock                              lock                           = new ReentrantReadWriteLock();
+    private final Lock                                       writeLock                      = this.lock.writeLock();
+    private final Lock                                       readLock                       = this.lock.readLock();
     private volatile boolean                                 stopped;
     private volatile boolean                                 hasError;
-    private long                                             nextWaitId            = 1;
-    private long                                             maxLogsInMemoryBytes  = -1;
-    private LogId                                            diskId                = new LogId(0, 0);
-    private LogId                                            appliedId             = new LogId(0, 0);
-    private final SegmentList<LogEntry>                      logsInMemory          = new SegmentList<>(true);
+    private long                                             nextWaitId                     = 1;
+    private long                                             maxLogsInMemoryBytes           = -1;
+    private LogId                                            diskId                         = new LogId(0, 0);
+    private LogId                                            appliedId                      = new LogId(0, 0);
+    private final SegmentList<LogEntry>                      logsInMemory                   = new SegmentList<>(true);
     private volatile long                                    firstLogIndex;
     private volatile long                                    lastLogIndex;
-    private volatile LogId                                   lastSnapshotId        = new LogId(0, 0);
-    private final Map<Long, WaitMeta>                        waitMap               = new HashMap<>();
+    private volatile LogId                                   lastSnapshotId                 = new LogId(0, 0);
+    private final Map<Long, WaitMeta>                        waitMap                        = new HashMap<>();
+
+    /**
+     * PATCH: last-resort executor for new-log wakeup callbacks when the
+     * group's closure pool rejects the dispatch. The waiter has already been removed
+     * from waitMap by the time we dispatch, and there is NO retry anywhere upstream --
+     * losing one dispatch permanently orphans the Replicator (leader->follower entry
+     * replication stalls while heartbeats keep flowing, the exact 2026-04-29 incident).
+     * Unbounded queue + single daemon thread: never rejects, so a wakeup can never be
+     * silently lost. Idle thread exits after 60s (allowCoreThreadTimeOut), so it costs
+     * nothing outside the rare rejection path. Must NOT run callbacks inline on the
+     * dispatching thread -- see notifyOnNewLog comment for the lock-ordering hazard.
+     */
+    private static final ThreadPoolExecutor                  NEW_LOG_WAKEUP_RESCUE_EXECUTOR = new ThreadPoolExecutor(
+                                                                                                1,
+                                                                                                1,
+                                                                                                60L,
+                                                                                                TimeUnit.SECONDS,
+                                                                                                new LinkedBlockingQueue<>(),
+                                                                                                new NamedThreadFactory(
+                                                                                                    "JRaft-NewLog-Wakeup-Rescue-",
+                                                                                                    true));
+
+    static {
+        NEW_LOG_WAKEUP_RESCUE_EXECUTOR.allowCoreThreadTimeOut(true);
+    }
     private Disruptor<StableClosureEvent>                    disruptor;
     private RingBuffer<StableClosureEvent>                   diskQueue;
     private RaftOptions                                      raftOptions;
     private volatile CountDownLatch                          shutDownLatch;
     private NodeMetrics                                      nodeMetrics;
-    private final CopyOnWriteArrayList<LastLogIndexListener> lastLogIndexListeners = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<LastLogIndexListener> lastLogIndexListeners          = new CopyOnWriteArrayList<>();
 
     private final static class LogsInMemoryMetricSet implements MetricSet {
         final SegmentList<LogEntry> logsInMemory;
@@ -427,7 +455,20 @@ public class LogManagerImpl implements LogManager {
         for (int i = 0; i < waiterCount; i++) {
             final WaitMeta wm = wms.get(i);
             wm.errorCode = errCode;
-            ThreadPoolsFactory.runInThread(this.groupId, () -> runOnNewLog(wm));
+            try {
+                ThreadPoolsFactory.runInThread(this.groupId, () -> runOnNewLog(wm));
+            } catch (final RejectedExecutionException e) {
+                // PATCH: waiter already removed from waitMap, no retry
+                // upstream -- a lost dispatch would permanently stall replication to
+                // this peer (Replicator#waitMoreEntries is guarded by waitId >= 0 and
+                // only the lost callback resets it). Fall back to the never-rejecting
+                // rescue executor. Also note: an uncaught exception here would abort
+                // this loop and lose ALL remaining waiters (both followers at once),
+                // and would escape into appendEntries BEFORE the diskQueue publish.
+                LOG.error("Group {} closure pool rejected a new-log wakeup, fall back to rescue executor.",
+                    this.groupId, e);
+                NEW_LOG_WAKEUP_RESCUE_EXECUTOR.execute(() -> runOnNewLog(wm));
+            }
         }
         return true;
     }
@@ -1142,7 +1183,23 @@ public class LogManagerImpl implements LogManager {
         try {
             if (expectedLastLogIndex != this.lastLogIndex || this.stopped) {
                 wm.errorCode = this.stopped ? RaftError.ESTOP.getNumber() : 0;
-                ThreadPoolsFactory.runInThread(this.groupId, () -> runOnNewLog(wm));
+                try {
+                    ThreadPoolsFactory.runInThread(this.groupId, () -> runOnNewLog(wm));
+                } catch (final RejectedExecutionException e) {
+                    // PATCH: same rescue as wakeupAllWaiter.
+                    // MUST NOT run the callback inline on this thread: the caller
+                    // (Replicator#waitMoreEntries) still holds the ThreadId lock
+                    // (ReentrantLock -- same-thread reentry would NOT block) and assigns
+                    // this.waitId AFTER wait() returns. An inline callback would reset
+                    // waitId to -1 first and then be overwritten by the pending
+                    // assignment, leaving the replicator believing it is parked while
+                    // no waiter is registered -- recreating the very orphan bug this
+                    // patch fixes. A separate thread blocks on the ThreadId lock until
+                    // the registering thread finishes, preserving the ordering invariant.
+                    LOG.error("Group {} closure pool rejected a new-log notify, fall back to rescue executor.",
+                        this.groupId, e);
+                    NEW_LOG_WAKEUP_RESCUE_EXECUTOR.execute(() -> runOnNewLog(wm));
+                }
                 return 0L;
             }
             long waitId = this.nextWaitId++;
@@ -1186,7 +1243,29 @@ public class LogManagerImpl implements LogManager {
     }
 
     void runOnNewLog(final WaitMeta wm) {
-        wm.onNewLog.onNewLog(wm.arg, wm.errorCode);
+        try {
+            wm.onNewLog.onNewLog(wm.arg, wm.errorCode);
+        } catch (final Throwable t) {
+            // PATCH: a Throwable escaping the callback (e.g. a transient
+            // failure inside Replicator#continueSending -> sendEntries) would otherwise
+            // be captured by the pool's FutureTask and the wakeup silently lost,
+            // permanently orphaning the Replicator. Log loudly and retry ONCE on the
+            // rescue executor (covers transient failures); if the retry throws again,
+            // give up loudly -- the commit-stall watchdog must take over from here.
+            // Retrying is safe: continueSending re-validates all state under the
+            // ThreadId lock, duplicate AppendEntries are idempotent on followers, and
+            // out-of-order responses are healed by resetInflights + probe.
+            LOG.error("Group {} new-log callback threw, retrying once on rescue executor.", this.groupId, t);
+            NEW_LOG_WAKEUP_RESCUE_EXECUTOR.execute(() -> {
+                try {
+                    wm.onNewLog.onNewLog(wm.arg, wm.errorCode);
+                } catch (final Throwable t2) {
+                    LOG.error("Group {} new-log callback threw AGAIN, giving up; entry replication to this "
+                              + "peer may stall until leadership change. Check commit-stall watchdog.",
+                        this.groupId, t2);
+                }
+            });
+        }
     }
 
     @Override
